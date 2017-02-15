@@ -500,6 +500,15 @@ class TestAutograd(TestCase):
         self.assertEqual(y.grad.data, torch.ones(5))
         self.assertEqual(z.grad.data, torch.ones(5) * 2)
 
+    def test_isolated_node(self):
+        x = Variable(torch.randn(5, 5), requires_grad=True)
+        y = Variable(torch.randn(5, 5), requires_grad=True)
+
+        a = x + y
+        b = torch.max(a, 1)[1].repeat(1, 5).double()
+        o = (b + a).sum()
+        o.backward()
+
     def test_backward_copy(self):
         # This tests checks backward engine for a very subtle bug that appreared
         # in one of the initial versions of autograd. Gradients tensors were

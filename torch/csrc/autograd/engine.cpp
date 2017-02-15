@@ -1,33 +1,72 @@
 #include "torch/csrc/autograd/engine.h"
 
-#include <set>
+#include <queue>
 #include <string>
+#include <cstdint>
+#include <unordered_set>
 #include <THPP/THPP.h>
 
 using thpp::Tensor;
 
 namespace torch { namespace autograd {
 
-auto Engine::compute_dependencies(function_queue& queue, ready_queue_type& ready) -> dependencies_type {
+namespace {
+
+struct function_visit {
+  function_visit(Function* fn, bool reachable)
+    : reachable(reachable)
+    , fn(fn)
+    {};
+
+  // Sort by (reachable, fn)
+  bool operator<(const function_visit& other) const {
+    int this_reachable = static_cast<int>(reachable);
+    int other_reachble = static_cast<int>(other.reachable);
+    if (this_reachable != other_reachble)
+      return this_reachable < other_reachble;
+    uintptr_t this_fn = reinterpret_cast<uintptr_t>(fn);
+    uintptr_t other_fn = reinterpret_cast<uintptr_t>(other.fn);
+    return this_fn < other_fn;
+  }
+
+  // Reachable from any of the backward roots via a path consisting only of
+  // Functions that require gradient
+  bool reachable;
+  Function* fn;
+};
+
+} // anonymous namespace
+
+auto Engine::compute_dependencies(function_queue& roots, ready_queue_type& ready) -> dependencies_type {
   dependencies_type dependencies;
-  std::set<Function*> seen;
+  std::unordered_map<Function*, bool> seen;
+  // Priority queue ensures that functions that are reachable by gradients
+  // will be visited first.
+  std::priority_queue<function_visit> queue;
+  for (auto& fn: roots)
+    queue.emplace(fn.get(), fn->requires_grad);
   while (queue.size() > 0) {
-    auto fn = std::move(queue.back()); queue.pop_back();
-    for (auto& prev_fn_pair : fn->previous_functions) {
-      auto& prev_fn = prev_fn_pair.first;
+    auto visit = queue.top(); queue.pop();
+    for (auto& prev_fn_pair : visit.fn->previous_functions) {
+      Function* prev_fn = prev_fn_pair.first.get();
+      // If prev_fn is reachable by the gradient. Can be overriden e.g. when a
+      // stochastic node is found.
+      bool reachable = visit.reachable && visit.fn->requires_grad;
       if (!prev_fn)
         continue;
-      if (dynamic_cast<Variable*>(prev_fn.get()))
+      if (dynamic_cast<Variable*>(prev_fn))
         continue;
-      // check for stochastic function
-      if (prev_fn->is_stochastic && seen.count(prev_fn.get()) == 0 && prev_fn->requires_grad) {
-        ready.emplace_back(prev_fn, GradBuffer(0));
-      } else if (fn->requires_grad && prev_fn->requires_grad) {
-        dependencies[prev_fn.get()] += 1;
+      // Check for stochastic function
+      if (prev_fn->is_stochastic && seen.count(prev_fn) == 0 && prev_fn->requires_grad) {
+        ready.emplace_back(prev_fn_pair.first, GradBuffer(0));
+        reachable = true;
+      } else if (reachable && visit.fn->requires_grad && prev_fn->requires_grad) {
+        dependencies[prev_fn] += 1;
       }
-      if (seen.count(prev_fn.get()) == 0) {
-        seen.insert(prev_fn.get());
-        queue.push_back(prev_fn);
+      auto it = seen.find(prev_fn);
+      if (it == seen.end() || (it->second == false && reachable)) {
+        seen[prev_fn] = reachable;
+        queue.emplace(prev_fn, reachable);
       }
     }
   }
@@ -37,7 +76,7 @@ auto Engine::compute_dependencies(function_queue& queue, ready_queue_type& ready
 auto Engine::backward(const variable_list& variables,
                       tensor_list& grad_variables,
                       bool retain_variables) -> void {
-  function_queue creators;
+  function_queue roots;
   ready_queue_type ready;
 
   bool did_leaf_backward = false;
@@ -52,7 +91,7 @@ auto Engine::backward(const variable_list& variables,
         did_leaf_backward = true;
       }
     } else {
-      creators.push_back(var->creator);
+      roots.push_back(var->creator);
       if (var->creator->requires_grad) {
         GradBuffer buf(var->creator->num_outputs);
         buf.addGrad(var->output_nr, Variable::of(std::move(grad)));
@@ -61,7 +100,7 @@ auto Engine::backward(const variable_list& variables,
     }
   }
 
-  auto dependencies = compute_dependencies(creators, ready);
+  auto dependencies = compute_dependencies(roots, ready);
 
   if (!did_leaf_backward && ready.size() == 0) {
     throw std::runtime_error(
