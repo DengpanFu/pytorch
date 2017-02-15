@@ -97,6 +97,7 @@ class build_module(Command):
 class build_ext(setuptools.command.build_ext.build_ext):
 
     def run(self):
+        global version, cwd
         # Print build options
         if WITH_NUMPY:
             print('-- Building with NumPy bindings')
@@ -110,6 +111,11 @@ class build_ext(setuptools.command.build_ext.build_ext):
             print('-- Detected CUDA at ' + CUDA_HOME)
         else:
             print('-- Not using CUDA')
+
+        # Replace __version__ in __init__.py
+        version_path = os.path.join(cwd, 'torch', 'version.py')
+        with open(version_path, 'w') as f:
+            f.write("__version__ = '{}'\n".format(version))
 
         # cwrap depends on pyyaml, so we can't import it earlier
         from tools.cwrap import cwrap
@@ -362,10 +368,18 @@ if WITH_CUDA:
                        )
     extensions.append(THCUNN)
 
-version = "0.1"
+version = '0.1.9'
 if os.getenv('PYTORCH_BUILD_VERSION'):
+    assert os.getenv('PYTORCH_BUILD_NUMBER') is not None
     version = os.getenv('PYTORCH_BUILD_VERSION') \
         + '_' + os.getenv('PYTORCH_BUILD_NUMBER')
+else:
+    try:
+        sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=cwd).decode('ascii').strip()
+        version += '+' + sha[:7]
+    except subprocess.CalledProcessError:
+        pass
+
 
 setup(name="torch", version=version,
       ext_modules=extensions,
